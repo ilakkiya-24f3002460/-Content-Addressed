@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import threading
+from copy import deepcopy
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -11,146 +12,73 @@ app = FastAPI()
 
 SAFE_MAX = 9007199254740991
 
-DAG = [
-    "verify_data",
-    "prepare",
-    "train",
-    "evaluate",
-    "register",
-    "publish",
-]
+FREEZE = "freeze"
+SELECT = "select"
 
-PARENT = {
-    "verify_data": None,
-    "prepare": "verify_data",
-    "train": "prepare",
-    "evaluate": "train",
-    "register": "evaluate",
-    "publish": "register",
+DAG = []
+
+# File names are treated as paths, not arbitrary executable paths.
+# The API itself does not impose a fixed extension list; it validates
+# safe artifact filenames and exact UTF-8 content.
+UNSAFE_FILENAME_PARTS = (
+    "\x00",
+)
+
+UNSAFE_EXTENSIONS = {
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".sh",
+    ".bat",
+    ".cmd",
+    ".com",
+    ".scr",
+    ".msi",
+    ".vbs",
+    ".ps1",
 }
 
-INPUT_NAMES = [
-    "generation",
-    "checksum",
-    "canonicalData",
-    "prepareCode",
-    "prepareConfig",
-    "trainCode",
-    "trainConfig",
-    "runtime",
-    "evaluateCode",
-    "evaluateConfig",
-    "schemaDigest",
-    "publishConfig",
-]
-
-NODE_INPUTS = {
-    "verify_data": [
-        "generation",
-        "checksum",
-    ],
-    "prepare": [
-        "canonicalData",
-        "prepareCode",
-        "prepareConfig",
-    ],
-    "train": [
-        "prepareArtifact",
-        "trainCode",
-        "trainConfig",
-        "runtime",
-    ],
-    "evaluate": [
-        "trainArtifact",
-        "canonicalData",
-        "evaluateCode",
-        "evaluateConfig",
-    ],
-    "register": [
-        "evaluateArtifact",
-        "schemaDigest",
-    ],
-    "publish": [
-        "registerArtifact",
-        "publishConfig",
-    ],
+FREEZE_CODES = {
+    "INVALID_INPUT",
+    "UNALLOWED_UNSUPPORTED_REASON",
+    "NOT_LOADABLE",
+    "CALIBRATION_MISMATCH",
+    "TOKENIZER_MISMATCH",
 }
 
-EVENT_STATUSES = {
-    "started",
-    "succeeded",
-    "retryable_failed",
-    "terminal_failed",
+SELECT_CODES = {
+    "NOT_FROZEN",
+    "INVALID_LINEAGE",
+    "INVALID_POLICY",
+    "INVALID_PREDICTIONS",
+    "INVALID_MANIFEST",
+    "AGGREGATE_FLOOR",
+    "MISSING_SLICE",
+    "SLICE_FLOOR",
+    "SIZE_LIMIT",
+    "LATENCY_LIMIT",
 }
 
-SUCCESS_STATUSES = {
-    "succeeded",
-}
+BINARY = {0, 1}
 
-FAILURE_STATUSES = {
-    "retryable_failed",
-    "terminal_failed",
-}
+# ------------------------------------------------------------
+# Persistent state.
+# ------------------------------------------------------------
 
-ERROR_CODES = {
-    "INVALID_REQUEST",
-    "INVALID_EVENT",
-    "EVENT_ID_CONFLICT",
-    "REVISION_CONFLICT",
-    "EVIDENCE_CONFLICT",
-    "STATUS_CONFLICT",
-}
-
-
-# ============================================================
-# Persistent process state
-# ============================================================
-
-STATE = {}
+STORE = {}
 LOCK = threading.RLock()
 
 
-# STATE[session] = {
-#     "revision": int,
-#     "inputs": dict,
-#     "inputFingerprint": str,
-#     "events": {
-#         eventId: canonicalEventJson
-#     },
-#     "eventRecords": {
-#         eventId: event
-#     },
-#     "nodes": {
-#         node: {
-#             "key": str,
-#             "status": None | started | retryable_failed |
-#                       terminal_failed | succeeded,
-#             "attempt": int | None,
-#             "artifactDigest": str | None,
-#             "eventIds": [...],
-#             "startEventId": str | None,
-#         }
-#     },
-#     "cache": {
-#         node: {
-#             cacheKey: {
-#                 "artifactDigest": str,
-#                 "eventId": str,
-#             }
-#         }
-#     }
-# }
-
-
 # ============================================================
-# Helpers
+# Deterministic JSON / hashing
 # ============================================================
 
-def utf8(value):
+def u8(value):
     return value.encode("utf-8")
 
 
-def compact(value):
+def canonical_json(value):
     return json.dumps(
         value,
         ensure_ascii=False,
@@ -158,24 +86,55 @@ def compact(value):
     )
 
 
-def digest_json_array(values):
-    return hashlib.sha256(
-        utf8(compact(values))
-    ).hexdigest()
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
 
 
-def fingerprint(value):
-    return hashlib.sha256(
-        utf8(compact(value))
-    ).hexdigest()
+def sha256_string(value):
+    return sha256_bytes(u8(value))
 
 
-def safe_positive_int(value):
+def digest_array(values):
+    return sha256_bytes(
+        u8(canonical_json(values))
+    )
+
+
+def utf8_sort(values):
+    return sorted(values, key=u8)
+
+
+def unique_sorted_codes(values):
+    return sorted(
+        set(values),
+        key=u8,
+    )
+
+
+def is_safe_int(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= SAFE_MAX
+    )
+
+
+def is_positive_safe_int(value):
     return (
         isinstance(value, int)
         and not isinstance(value, bool)
         and 1 <= value <= SAFE_MAX
     )
+
+
+def is_finite_number(value):
+    if isinstance(value, bool):
+        return False
+
+    if not isinstance(value, (int, float)):
+        return False
+
+    return math.isfinite(float(value))
 
 
 def nonempty_string(value):
@@ -185,1185 +144,1469 @@ def nonempty_string(value):
     )
 
 
-def error(code):
-    return JSONResponse(
-        status_code=409,
-        content={
-            "error": code
-        },
-    )
-
-
-def bad_request():
-    return JSONResponse(
-        status_code=400,
-        content={
-            "error": "INVALID_REQUEST"
-        },
-    )
-
-
-# ============================================================
-# DAG / dependency helpers
-# ============================================================
-
-def node_ready(session_state, node):
-    parent = PARENT[node]
-
-    if parent is None:
-        return True
-
-    parent_state = session_state["nodes"][parent]
-
-    return (
-        parent_state["status"]
-        == "succeeded"
-    )
-
-
-def parent_state(session_state, node):
-    parent = PARENT[node]
-
-    if parent is None:
-        return None
-
-    return session_state["nodes"][parent]
-
-
-def dependency_values(session_state, node):
-    """
-    Construct the exact values used to calculate a node key.
-
-    Parent artifacts are represented as:
-      prepareArtifact
-      trainArtifact
-      evaluateArtifact
-      registerArtifact
-    """
-
-    values = {}
-
-    parent = PARENT[node]
-
-    if parent is not None:
-        parent_state = session_state["nodes"][parent]
-
-        artifact_name = {
-            "prepare": "prepareArtifact",
-            "train": "trainArtifact",
-            "evaluate": "evaluateArtifact",
-            "register": "registerArtifact",
-            "publish": "publishArtifact",
-        }.get(node)
-
-        if artifact_name is not None:
-            values[artifact_name] = (
-                parent_state["artifactDigest"]
-            )
-
-    # For the six node definitions, add the named inputs.
-    for name in NODE_INPUTS[node]:
-
-        if name in values:
-            continue
-
-        if name in session_state["inputs"]:
-            values[name] = session_state[
-                "inputs"
-            ][name]
-
-    return values
-
-
-def calculate_node_key(
-    session_state,
-    node,
-):
-    values = dependency_values(
-        session_state,
-        node,
-    )
-
-    ordered_values = []
-
-    for name in NODE_INPUTS[node]:
-        ordered_values.append(
-            values.get(name)
-        )
-
-    return digest_json_array(
-        ordered_values
-    )
-
-
-def dependency_digests(
-    session_state,
-    node,
-    cache_key,
-):
-    values = dependency_values(
-        session_state,
-        node,
-    )
-
-    result = {}
-
-    for name in NODE_INPUTS[node]:
-        result[name] = values.get(name)
-
-    result["cacheKey"] = cache_key
-
-    return result
-
-
-# ============================================================
-# State creation
-# ============================================================
-
-def make_node_state():
-    return {
-        "key": None,
-        "status": None,
-        "attempt": None,
-        "artifactDigest": None,
-        "eventIds": [],
-        "startEventId": None,
-    }
-
-
-def make_state(
-    revision,
-    inputs,
-    input_fingerprint,
-):
-    return {
-        "revision": revision,
-        "inputs": inputs,
-        "inputFingerprint": input_fingerprint,
-        "events": {},
-        "eventRecords": {},
-        "nodes": {
-            node: make_node_state()
-            for node in DAG
-        },
-        "cache": {
-            node: {}
-            for node in DAG
-        },
-    }
-
-
-# ============================================================
-# Request validation
-# ============================================================
-
-def validate_pipeline_request(body):
-
-    if not isinstance(body, dict):
+def valid_utf8_string(value):
+    if not isinstance(value, str):
         return False
+
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+
+    return len(value) > 0
+
+
+def fingerprint(value):
+    return sha256_string(
+        canonical_json(value)
+    )
+
+
+def http_error(status, code):
+    return JSONResponse(
+        status_code=status,
+        content={"error": code},
+    )
+
+
+# ============================================================
+# Filename validation
+# ============================================================
+
+def valid_filename(name):
+    if not isinstance(name, str):
+        return False
+
+    if len(name) == 0:
+        return False
+
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+
+    if any(
+        part in name
+        for part in UNSAFE_FILENAME_PARTS
+    ):
+        return False
+
+    # No absolute paths.
+    if name.startswith("/"):
+        return False
+
+    if name.startswith("\\"):
+        return False
+
+    # No path traversal.
+    pieces = name.replace("\\", "/").split("/")
+
+    if any(
+        piece in ("", ".", "..")
+        for piece in pieces
+    ):
+        return False
+
+    # No Windows drive paths.
+    if len(name) >= 2 and name[1] == ":":
+        return False
+
+    lowered = name.lower()
+
+    for ext in UNSAFE_EXTENSIONS:
+        if lowered.endswith(ext):
+            return False
+
+    return True
+
+
+# ============================================================
+# Freeze manifest
+# ============================================================
+
+def calculate_inventory(files):
+    """
+    Calculate inventory exclusively from the supplied exact
+    UTF-8 strings.
+
+    Output key order:
+        name, bytes, sha256
+    """
+
+    inventory = []
+
+    for filename in sorted(
+        files.keys(),
+        key=u8,
+    ):
+        content = files[filename]
+
+        raw = u8(content)
+
+        inventory.append({
+            "name": filename,
+            "bytes": len(raw),
+            "sha256": sha256_bytes(raw),
+        })
+
+    return inventory
+
+
+def calculate_package_digest(inventory):
+    return sha256_bytes(
+        u8(canonical_json(inventory))
+    )
+
+
+def validate_files_object(files):
+    if not isinstance(files, dict):
+        return False
+
+    if len(files) == 0:
+        return False
+
+    seen = set()
+
+    for filename, content in files.items():
+
+        if not valid_filename(filename):
+            return False
+
+        if filename in seen:
+            return False
+
+        seen.add(filename)
+
+        if not valid_utf8_string(content):
+            return False
+
+    return True
+
+
+# ============================================================
+# Freeze candidate
+# ============================================================
+
+def freeze_one_candidate(
+    candidate,
+    request_calibration,
+    request_tokenizer,
+    allowed_reasons,
+):
+
+    # Candidate itself must be an object.
+    if not isinstance(candidate, dict):
+        return {
+            "name": "",
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": [
+                "INVALID_INPUT"
+            ],
+        }
 
     required = {
-        "session",
-        "revision",
-        "inputs",
-        "events",
+        "name",
+        "files",
+        "loadable",
+        "calibrationDigest",
+        "tokenizerDigest",
+        "unsupportedReason",
     }
 
-    if not required.issubset(
-        set(body.keys())
-    ):
-        return False
+    if set(candidate.keys()) != required:
 
-    if not nonempty_string(
-        body["session"]
-    ):
-        return False
+        name = candidate.get("name")
 
-    if not safe_positive_int(
-        body["revision"]
-    ):
-        return False
+        return {
+            "name": (
+                name
+                if isinstance(name, str)
+                else ""
+            ),
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": [
+                "INVALID_INPUT"
+            ],
+        }
+
+    name = candidate["name"]
+
+    if not valid_utf8_string(name):
+
+        return {
+            "name": (
+                name
+                if isinstance(name, str)
+                else ""
+            ),
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": [
+                "INVALID_INPUT"
+            ],
+        }
+
+    files = candidate["files"]
+
+    # --------------------------------------------------------
+    # Invalid files => exactly empty manifest.
+    # --------------------------------------------------------
+
+    if not validate_files_object(files):
+
+        return {
+            "name": name,
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": [
+                "INVALID_INPUT"
+            ],
+        }
 
     if not isinstance(
-        body["inputs"],
+        candidate["loadable"],
+        bool,
+    ):
+        return {
+            "name": name,
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": [
+                "INVALID_INPUT"
+            ],
+        }
+
+    if not valid_utf8_string(
+        candidate["calibrationDigest"]
+    ):
+        return {
+            "name": name,
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": [
+                "INVALID_INPUT"
+            ],
+        }
+
+    if not valid_utf8_string(
+        candidate["tokenizerDigest"]
+    ):
+        return {
+            "name": name,
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": [
+                "INVALID_INPUT"
+            ],
+        }
+
+    unsupported = candidate[
+        "unsupportedReason"
+    ]
+
+    if unsupported is not None:
+
+        if not valid_utf8_string(
+            unsupported
+        ):
+            return {
+                "name": name,
+                "status": "invalid",
+                "inventory": [],
+                "totalBytes": None,
+                "packageDigest": None,
+                "reasonCodes": [
+                    "INVALID_INPUT"
+                ],
+            }
+
+    # --------------------------------------------------------
+    # Exact artifact inventory.
+    # --------------------------------------------------------
+
+    inventory = calculate_inventory(
+        files
+    )
+
+    total_bytes = sum(
+        entry["bytes"]
+        for entry in inventory
+    )
+
+    package_digest = calculate_package_digest(
+        inventory
+    )
+
+    codes = []
+
+    # --------------------------------------------------------
+    # Unsupported candidate.
+    # --------------------------------------------------------
+
+    if unsupported is not None:
+
+        if unsupported not in allowed_reasons:
+            codes.append(
+                "UNALLOWED_UNSUPPORTED_REASON"
+            )
+
+    else:
+
+        if candidate["loadable"] is not True:
+            codes.append(
+                "NOT_LOADABLE"
+            )
+
+        if (
+            candidate["calibrationDigest"]
+            != request_calibration
+        ):
+            codes.append(
+                "CALIBRATION_MISMATCH"
+            )
+
+        if (
+            candidate["tokenizerDigest"]
+            != request_tokenizer
+        ):
+            codes.append(
+                "TOKENIZER_MISMATCH"
+            )
+
+    codes = unique_sorted_codes(codes)
+
+    if codes:
+
+        return {
+            "name": name,
+            "status": "invalid",
+            "inventory": inventory,
+            "totalBytes": total_bytes,
+            "packageDigest": package_digest,
+            "reasonCodes": codes,
+        }
+
+    if unsupported is not None:
+
+        return {
+            "name": name,
+            "status": "unsupported",
+            "inventory": inventory,
+            "totalBytes": total_bytes,
+            "packageDigest": package_digest,
+            "reasonCodes": [],
+        }
+
+    return {
+        "name": name,
+        "status": "frozen",
+        "inventory": inventory,
+        "totalBytes": total_bytes,
+        "packageDigest": package_digest,
+        "reasonCodes": [],
+    }
+
+
+# ============================================================
+# Freeze validation
+# ============================================================
+
+def validate_freeze_request(body):
+
+    required = {
+        "phase",
+        "freezeId",
+        "calibrationDigest",
+        "tokenizerDigest",
+        "allowedUnsupportedReasons",
+        "candidates",
+    }
+
+    if set(body.keys()) != required:
+        return False
+
+    if body["phase"] != FREEZE:
+        return False
+
+    if (
+        not isinstance(
+            body["freezeId"],
+            str,
+        )
+        or len(body["freezeId"]) == 0
+        or len(body["freezeId"]) > 128
+    ):
+        return False
+
+    if not valid_utf8_string(
+        body["calibrationDigest"]
+    ):
+        return False
+
+    if not valid_utf8_string(
+        body["tokenizerDigest"]
+    ):
+        return False
+
+    allowed = body[
+        "allowedUnsupportedReasons"
+    ]
+
+    if not isinstance(allowed, list):
+        return False
+
+    for reason in allowed:
+        if not valid_utf8_string(reason):
+            return False
+
+    if len(allowed) != len(set(allowed)):
+        return False
+
+    candidates = body["candidates"]
+
+    if not isinstance(candidates, list):
+        return False
+
+    if len(candidates) == 0:
+        return False
+
+    names = set()
+
+    for candidate in candidates:
+
+        if not isinstance(candidate, dict):
+            return False
+
+        name = candidate.get("name")
+
+        if not valid_utf8_string(name):
+            return False
+
+        if name in names:
+            return False
+
+        names.add(name)
+
+    return True
+
+
+def create_freeze_response(body):
+
+    if not validate_freeze_request(body):
+        return None
+
+    candidates = []
+
+    for candidate in body["candidates"]:
+
+        candidates.append(
+            freeze_one_candidate(
+                candidate,
+                body["calibrationDigest"],
+                body["tokenizerDigest"],
+                set(
+                    body[
+                        "allowedUnsupportedReasons"
+                    ]
+                ),
+            )
+        )
+
+    candidates.sort(
+        key=lambda item: u8(
+            item["name"]
+        )
+    )
+
+    return {
+        "freezeId": body["freezeId"],
+        "candidates": candidates,
+    }
+
+
+# ============================================================
+# Submitted frozen candidate validation
+# ============================================================
+
+def validate_submitted_candidate(
+    candidate
+):
+    """
+    Recompute every manifest property from the submitted
+    inventory.
+
+    There is deliberately no trust in:
+      totalBytes
+      packageDigest
+    """
+
+    if not isinstance(candidate, dict):
+        return False, None, None
+
+    required = {
+        "name",
+        "status",
+        "inventory",
+        "totalBytes",
+        "packageDigest",
+        "reasonCodes",
+    }
+
+    if set(candidate.keys()) != required:
+        return False, None, None
+
+    name = candidate["name"]
+
+    if not valid_utf8_string(name):
+        return False, None, None
+
+    status = candidate["status"]
+
+    if status not in (
+        "frozen",
+        "unsupported",
+        "invalid",
+    ):
+        return False, None, None
+
+    reason_codes = candidate[
+        "reasonCodes"
+    ]
+
+    if not isinstance(
+        reason_codes,
+        list,
+    ):
+        return False, None, None
+
+    if reason_codes != unique_sorted_codes(
+        reason_codes
+    ):
+        return False, None, None
+
+    # --------------------------------------------------------
+    # Invalid frozen candidate has no artifact manifest.
+    # --------------------------------------------------------
+
+    if status == "invalid":
+
+        if candidate["inventory"] != []:
+            return False, None, None
+
+        if candidate["totalBytes"] is not None:
+            return False, None, None
+
+        if candidate["packageDigest"] is not None:
+            return False, None, None
+
+        return True, None, None
+
+    inventory = candidate[
+        "inventory"
+    ]
+
+    if not isinstance(
+        inventory,
+        list,
+    ):
+        return False, None, None
+
+    if len(inventory) == 0:
+        return False, None, None
+
+    normalized = []
+    names = set()
+    total = 0
+
+    for item in inventory:
+
+        if not isinstance(item, dict):
+            return False, None, None
+
+        if set(item.keys()) != {
+            "name",
+            "bytes",
+            "sha256",
+        }:
+            return False, None, None
+
+        name_i = item["name"]
+        bytes_i = item["bytes"]
+        hash_i = item["sha256"]
+
+        if not valid_filename(name_i):
+            return False, None, None
+
+        if name_i in names:
+            return False, None, None
+
+        names.add(name_i)
+
+        if not is_safe_int(bytes_i):
+            return False, None, None
+
+        if (
+            not isinstance(hash_i, str)
+            or len(hash_i) != 64
+            or any(
+                c not in "0123456789abcdef"
+                for c in hash_i
+            )
+        ):
+            return False, None, None
+
+        normalized.append({
+            "name": name_i,
+            "bytes": bytes_i,
+            "sha256": hash_i,
+        })
+
+        total += bytes_i
+
+        if total > SAFE_MAX:
+            return False, None, None
+
+    # Exact UTF-8 ordering.
+    expected_order = sorted(
+        normalized,
+        key=lambda item: u8(
+            item["name"]
+        ),
+    )
+
+    if normalized != expected_order:
+        return False, None, None
+
+    calculated_digest = (
+        calculate_package_digest(
+            normalized
+        )
+    )
+
+    if candidate[
+        "totalBytes"
+    ] != total:
+        return False, None, None
+
+    if candidate[
+        "packageDigest"
+    ] != calculated_digest:
+        return False, None, None
+
+    return (
+        True,
+        total,
+        calculated_digest,
+    )
+
+
+# ============================================================
+# Selection policy
+# ============================================================
+
+def validate_policy(policy):
+
+    required = {
+        "maxBytes",
+        "aggregateFloor",
+        "requiredSlices",
+        "maxLatencyMs",
+        "candidateOrder",
+    }
+
+    if not isinstance(policy, dict):
+        return False
+
+    if set(policy.keys()) != required:
+        return False
+
+    if not is_safe_int(
+        policy["maxBytes"]
+    ):
+        return False
+
+    if not is_finite_number(
+        policy["aggregateFloor"]
+    ):
+        return False
+
+    if not (
+        0 <= float(
+            policy["aggregateFloor"]
+        ) <= 1
+    ):
+        return False
+
+    required_slices = policy[
+        "requiredSlices"
+    ]
+
+    if not isinstance(
+        required_slices,
         dict,
     ):
         return False
 
-    if not isinstance(
-        body["events"],
-        list,
+    for name, floor in required_slices.items():
+
+        if not valid_utf8_string(name):
+            return False
+
+        if not is_finite_number(floor):
+            return False
+
+        if not (
+            0 <= float(floor) <= 1
+        ):
+            return False
+
+    if not is_finite_number(
+        policy["maxLatencyMs"]
     ):
         return False
 
-    for name in INPUT_NAMES:
+    if float(
+        policy["maxLatencyMs"]
+    ) < 0:
+        return False
 
-        if not nonempty_string(
-            body["inputs"].get(name)
-        ):
-            return False
+    order = policy[
+        "candidateOrder"
+    ]
+
+    if not isinstance(order, list):
+        return False
+
+    if len(order) == 0:
+        return False
+
+    if any(
+        not valid_utf8_string(name)
+        for name in order
+    ):
+        return False
+
+    if len(order) != len(set(order)):
+        return False
 
     return True
 
 
 # ============================================================
-# Event validation
+# Selection rows
 # ============================================================
 
-def validate_event(event):
+def validate_row(row):
 
-    if not isinstance(event, dict):
+    if not isinstance(row, dict):
         return False
 
-    required = {
-        "eventId",
-        "revision",
-        "node",
-        "attempt",
-        "status",
-        "key",
-        "artifactDigest",
-        "receiptId",
+    if set(row.keys()) != {
+        "label",
+        "slice",
+        "predictions",
+    }:
+        return False
+
+    label = row["label"]
+
+    if (
+        not isinstance(label, int)
+        or isinstance(label, bool)
+        or label not in BINARY
+    ):
+        return False
+
+    if not valid_utf8_string(
+        row["slice"]
+    ):
+        return False
+
+    predictions = row[
+        "predictions"
+    ]
+
+    if not isinstance(
+        predictions,
+        dict,
+    ):
+        return False
+
+    return True
+
+
+def prediction_for(
+    row,
+    candidate_name,
+):
+    predictions = row[
+        "predictions"
+    ]
+
+    if candidate_name not in predictions:
+        return None, False
+
+    prediction = predictions[
+        candidate_name
+    ]
+
+    if (
+        not isinstance(
+            prediction,
+            int,
+        )
+        or isinstance(
+            prediction,
+            bool,
+        )
+        or prediction not in BINARY
+    ):
+        return None, False
+
+    return prediction, True
+
+
+# ============================================================
+# Selection
+# ============================================================
+
+def perform_select(
+    body,
+    frozen_response,
+):
+
+    freeze_id = body[
+        "freezeId"
+    ]
+
+    submitted = body[
+        "candidates"
+    ]
+
+    policy = body[
+        "policy"
+    ]
+
+    latencies = body[
+        "latencies"
+    ]
+
+    rows = body[
+        "rows"
+    ]
+
+    frozen = frozen_response[
+        "candidates"
+    ]
+
+    # --------------------------------------------------------
+    # Exact candidate array comparison.
+    # --------------------------------------------------------
+
+    lineage_match = (
+        submitted == frozen
+    )
+
+    # --------------------------------------------------------
+    # Frozen names.
+    # --------------------------------------------------------
+
+    frozen_names = [
+        c["name"]
+        for c in frozen
+        if isinstance(c, dict)
+        and isinstance(
+            c.get("name"),
+            str,
+        )
+    ]
+
+    candidate_map = {
+        c["name"]: c
+        for c in frozen
+        if isinstance(c, dict)
+        and isinstance(
+            c.get("name"),
+            str,
+        )
     }
 
-    if set(event.keys()) != required:
-        return False
+    # --------------------------------------------------------
+    # Policy.
+    # --------------------------------------------------------
 
-    if not nonempty_string(
-        event["eventId"]
-    ):
-        return False
+    policy_valid = validate_policy(
+        policy
+    )
 
-    if not safe_positive_int(
-        event["revision"]
-    ):
-        return False
+    candidate_order = (
+        policy.get("candidateOrder")
+        if isinstance(policy, dict)
+        else []
+    )
 
-    if event["node"] not in DAG:
-        return False
+    order_valid = (
+        policy_valid
+        and len(candidate_order)
+        == len(frozen_names)
+        and set(candidate_order)
+        == set(frozen_names)
+        and len(candidate_order)
+        == len(set(candidate_order))
+    )
 
-    if not safe_positive_int(
-        event["attempt"]
-    ):
-        return False
-
-    if event["status"] not in EVENT_STATUSES:
-        return False
-
-    if not nonempty_string(
-        event["key"]
-    ):
-        return False
-
-    status = event["status"]
-
-    artifact = event["artifactDigest"]
-    receipt = event["receiptId"]
-
-    if status == "succeeded":
-
-        if not nonempty_string(artifact):
-            return False
-
+    if order_valid:
+        names = list(candidate_order)
     else:
-
-        if artifact is not None:
-            return False
-
-    if status in (
-        "succeeded",
-    ) and event["node"] in (
-        "register",
-        "publish",
-    ):
-
-        expected = (
-            "receipt:"
-            + event["node"]
-            + ":"
-            + event["key"]
+        names = sorted(
+            candidate_map.keys(),
+            key=u8,
         )
 
-        if receipt != expected:
-            return False
-
-    else:
-
-        if receipt is not None:
-            return False
-
-    return True
-
-
-# ============================================================
-# Event transition logic
-# ============================================================
-
-def transition_event(
-    session_state,
-    event,
-):
-    node = event["node"]
-    node_state = session_state[
-        "nodes"
-    ][node]
-
-    incoming_status = event[
-        "status"
-    ]
-    incoming_attempt = event[
-        "attempt"
-    ]
-    incoming_key = event["key"]
-
-    current_key = node_state[
-        "key"
-    ]
-    current_status = node_state[
-        "status"
-    ]
-    current_attempt = node_state[
-        "attempt"
-    ]
+    order_index = {
+        name: i
+        for i, name in enumerate(names)
+    }
 
     # --------------------------------------------------------
-    # Event for a stale/different key is ignored unless it
-    # attempts to contradict a current immutable success.
+    # Row validity.
     # --------------------------------------------------------
 
-    if current_key is not None:
-        if incoming_key != current_key:
+    rows_valid = (
+        isinstance(rows, list)
+        and len(rows) > 0
+        and all(
+            validate_row(row)
+            for row in rows
+        )
+    )
 
-            # A successful cached/current state is immutable.
-            if current_status == "succeeded":
-                return "ignore", None
+    results = []
 
-            # A node may receive an event only for its current key.
-            return "ignore", None
+    for name in names:
 
-    # --------------------------------------------------------
-    # No current state.
-    # --------------------------------------------------------
+        codes = []
 
-    if current_status is None:
+        aggregate = None
+        slice_values = {}
+        total_bytes = None
+        latency_ms = None
 
-        if incoming_status == "started":
-            if incoming_attempt != 1:
-                return "ignore", None
+        candidate = candidate_map.get(
+            name
+        )
 
-            node_state["key"] = incoming_key
-            node_state["status"] = "started"
-            node_state["attempt"] = 1
-            node_state["artifactDigest"] = None
-            node_state["eventIds"].append(
-                event["eventId"]
-            )
-            node_state["startEventId"] = (
-                event["eventId"]
+        # ----------------------------------------------------
+        # Lineage.
+        # ----------------------------------------------------
+
+        if candidate is None:
+            codes.append(
+                "NOT_FROZEN"
             )
 
-            return "accept", None
-
-        # Completion without start is ignored.
-        return "ignore", None
-
-    # --------------------------------------------------------
-    # Existing started state.
-    # --------------------------------------------------------
-
-    if current_status == "started":
-
-        if (
-            incoming_attempt
-            == current_attempt
-            and incoming_status in (
-                "succeeded",
-                "retryable_failed",
-                "terminal_failed",
-            )
-        ):
-
-            node_state["status"] = (
-                incoming_status
+        if not lineage_match:
+            codes.append(
+                "INVALID_LINEAGE"
             )
 
-            node_state["artifactDigest"] = (
-                event["artifactDigest"]
+        # ----------------------------------------------------
+        # Policy.
+        # ----------------------------------------------------
+
+        if not policy_valid:
+            codes.append(
+                "INVALID_POLICY"
             )
 
-            node_state["eventIds"].append(
-                event["eventId"]
+        # ----------------------------------------------------
+        # Artifact integrity.
+        # ----------------------------------------------------
+
+        manifest_valid = False
+
+        if candidate is not None:
+
+            (
+                manifest_valid,
+                calculated_bytes,
+                _,
+            ) = validate_submitted_candidate(
+                candidate
             )
 
-            return "accept", None
+            if not manifest_valid:
+                codes.append(
+                    "INVALID_MANIFEST"
+                )
+            else:
+                total_bytes = calculated_bytes
 
-        # Lower attempt is ignored.
-        if incoming_attempt < current_attempt:
-            return "ignore", None
-
-        return "conflict", "STATUS_CONFLICT"
-
-    # --------------------------------------------------------
-    # Retryable failure.
-    # --------------------------------------------------------
-
-    if current_status == "retryable_failed":
-
-        if (
-            incoming_status == "started"
-            and incoming_attempt
-            == current_attempt + 1
-        ):
-
-            node_state["status"] = "started"
-            node_state["attempt"] = (
-                incoming_attempt
-            )
-            node_state["artifactDigest"] = None
-            node_state["eventIds"].append(
-                event["eventId"]
-            )
-            node_state["startEventId"] = (
-                event["eventId"]
-            )
-
-            return "accept", None
-
-        if incoming_attempt < current_attempt:
-            return "ignore", None
-
-        return "conflict", "STATUS_CONFLICT"
-
-    # --------------------------------------------------------
-    # Terminal failure.
-    # --------------------------------------------------------
-
-    if current_status == "terminal_failed":
-        return "conflict", "STATUS_CONFLICT"
-
-    # --------------------------------------------------------
-    # Successful state.
-    # --------------------------------------------------------
-
-    if current_status == "succeeded":
-
-        if (
-            incoming_status == "succeeded"
-            and incoming_key == current_key
-        ):
-
-            if (
-                event["artifactDigest"]
-                != node_state["artifactDigest"]
-            ):
-                return (
-                    "conflict",
-                    "EVIDENCE_CONFLICT",
+            if candidate.get(
+                "status"
+            ) != "frozen":
+                codes.append(
+                    "INVALID_LINEAGE"
                 )
 
-            return "conflict", "STATUS_CONFLICT"
-
-        return "conflict", "STATUS_CONFLICT"
-
-    return "conflict", "STATUS_CONFLICT"
-
-
-# ============================================================
-# Cache handling
-# ============================================================
-
-def cache_success(
-    session_state,
-    node,
-    key,
-    artifact,
-    event_id,
-):
-    cache = session_state[
-        "cache"
-    ][node]
-
-    existing = cache.get(key)
-
-    if existing is not None:
+        # ----------------------------------------------------
+        # Latency.
+        # ----------------------------------------------------
 
         if (
-            existing["artifactDigest"]
-            != artifact
-        ):
-            return False
-
-        return True
-
-    cache[key] = {
-        "artifactDigest": artifact,
-        "eventId": event_id,
-    }
-
-    return True
-
-
-def apply_cached_state(
-    session_state,
-    node,
-    key,
-):
-    cached = session_state[
-        "cache"
-    ][node].get(key)
-
-    if cached is None:
-        return False
-
-    node_state = session_state[
-        "nodes"
-    ][node]
-
-    node_state["key"] = key
-    node_state["status"] = "succeeded"
-    node_state["attempt"] = None
-    node_state["artifactDigest"] = (
-        cached["artifactDigest"]
-    )
-    node_state["eventIds"] = [
-        cached["eventId"]
-    ]
-    node_state["startEventId"] = None
-
-    return True
-
-
-# ============================================================
-# Process one event
-# ============================================================
-
-def process_event(
-    session_state,
-    event,
-    accepted,
-    ignored,
-):
-    event_id = event[
-        "eventId"
-    ]
-
-    canonical_event = compact(
-        event
-    )
-
-    # --------------------------------------------------------
-    # Exact replay.
-    # --------------------------------------------------------
-
-    existing = session_state[
-        "events"
-    ].get(event_id)
-
-    if existing is not None:
-
-        if existing == canonical_event:
-            ignored.append(event_id)
-            return None
-
-        return "EVENT_ID_CONFLICT"
-
-    # --------------------------------------------------------
-    # Revision mismatch: ignored and does not consume ID.
-    # --------------------------------------------------------
-
-    if event["revision"] != session_state[
-        "revision"
-    ]:
-        ignored.append(event_id)
-        return None
-
-    # --------------------------------------------------------
-    # Node must be ready.
-    # --------------------------------------------------------
-
-    node = event["node"]
-
-    if not node_ready(
-        session_state,
-        node,
-    ):
-        ignored.append(event_id)
-        return None
-
-    # --------------------------------------------------------
-    # Calculate current key.
-    # --------------------------------------------------------
-
-    key = calculate_node_key(
-        session_state,
-        node,
-    )
-
-    # Wrong key is ignored and does not consume ID.
-    if event["key"] != key:
-        ignored.append(event_id)
-        return None
-
-    # --------------------------------------------------------
-    # Immutable cache conflict.
-    # --------------------------------------------------------
-
-    cached = session_state[
-        "cache"
-    ][node].get(key)
-
-    if cached is not None:
-
-        if event["status"] == "succeeded":
-
-            if (
-                event["artifactDigest"]
-                != cached["artifactDigest"]
-            ):
-                return "EVIDENCE_CONFLICT"
-
-            # Same immutable evidence but a new event
-            # is still not a valid state transition.
-            return "STATUS_CONFLICT"
-
-        return "STATUS_CONFLICT"
-
-    # --------------------------------------------------------
-    # Apply transition.
-    # --------------------------------------------------------
-
-    result, conflict = transition_event(
-        session_state,
-        event,
-    )
-
-    if result == "ignore":
-        ignored.append(event_id)
-        return None
-
-    if result == "conflict":
-        return conflict
-
-    # --------------------------------------------------------
-    # Record event only after successful transition.
-    # --------------------------------------------------------
-
-    session_state[
-        "events"
-    ][event_id] = canonical_event
-
-    session_state[
-        "eventRecords"
-    ][event_id] = dict(event)
-
-    accepted.append(event_id)
-
-    # --------------------------------------------------------
-    # Successful artifact becomes immutable cache evidence.
-    # --------------------------------------------------------
-
-    if event["status"] == "succeeded":
-
-        ok = cache_success(
-            session_state,
-            node,
-            key,
-            event["artifactDigest"],
-            event_id,
-        )
-
-        if not ok:
-            return "EVIDENCE_CONFLICT"
-
-    return None
-
-
-# ============================================================
-# Response construction
-# ============================================================
-
-def node_output(
-    session_state,
-    node,
-):
-    node_state = session_state[
-        "nodes"
-    ][node]
-
-    key = calculate_node_key(
-        session_state,
-        node,
-    )
-
-    # --------------------------------------------------------
-    # Cache hit.
-    # --------------------------------------------------------
-
-    cached = session_state[
-        "cache"
-    ][node].get(key)
-
-    if cached is not None:
-
-        return {
-            "node": node,
-            "action": "reuse",
-            "reasonCodes": [
-                "CACHE_HIT"
-            ],
-            "dependencyDigests":
-                dependency_digests(
-                    session_state,
-                    node,
-                    key,
-                ),
-            "triggeringEventIds": [
-                cached["eventId"]
-            ],
-        }
-
-    # --------------------------------------------------------
-    # Current node state.
-    # --------------------------------------------------------
-
-    if (
-        node_state["key"] == key
-        and node_state["status"] == "started"
-    ):
-
-        return {
-            "node": node,
-            "action": "block",
-            "reasonCodes": [
-                "RUNNING"
-            ],
-            "dependencyDigests":
-                dependency_digests(
-                    session_state,
-                    node,
-                    key,
-                ),
-            "triggeringEventIds": [
-                node_state[
-                    "startEventId"
-                ]
-            ]
-            if node_state[
-                "startEventId"
-            ]
-            else [],
-        }
-
-    if (
-        node_state["key"] == key
-        and node_state["status"]
-        == "terminal_failed"
-    ):
-
-        return {
-            "node": node,
-            "action": "block",
-            "reasonCodes": [
-                "TERMINAL_FAILURE"
-            ],
-            "dependencyDigests":
-                dependency_digests(
-                    session_state,
-                    node,
-                    key,
-                ),
-            "triggeringEventIds":
-                list(
-                    node_state[
-                        "eventIds"
-                    ]
-                ),
-        }
-
-    if (
-        node_state["key"] == key
-        and node_state["status"]
-        == "retryable_failed"
-    ):
-
-        return {
-            "node": node,
-            "action": "rerun",
-            "reasonCodes": [
-                "RETRYABLE_FAILURE"
-            ],
-            "dependencyDigests":
-                dependency_digests(
-                    session_state,
-                    node,
-                    key,
-                ),
-            "triggeringEventIds":
-                list(
-                    node_state[
-                        "eventIds"
-                    ]
-                ),
-        }
-
-    # --------------------------------------------------------
-    # Upstream status.
-    # --------------------------------------------------------
-
-    parent = PARENT[node]
-
-    if parent is not None:
-
-        parent_state = session_state[
-            "nodes"
-        ][parent]
-
-        parent_key = calculate_node_key(
-            session_state,
-            parent,
-        )
-
-        parent_cache = session_state[
-            "cache"
-        ][parent].get(parent_key)
-
-        if parent_cache is None:
-
-            if (
-                parent_state["status"]
-                == "terminal_failed"
-            ):
-
-                return {
-                    "node": node,
-                    "action": "block",
-                    "reasonCodes": [
-                        "UPSTREAM_TERMINAL"
-                    ],
-                    "dependencyDigests":
-                        dependency_digests(
-                            session_state,
-                            node,
-                            key,
-                        ),
-                    "triggeringEventIds":
-                        list(
-                            parent_state[
-                                "eventIds"
-                            ]
-                        ),
-                }
-
-            return {
-                "node": node,
-                "action": "block",
-                "reasonCodes": [
-                    "UPSTREAM_PENDING"
-                ],
-                "dependencyDigests":
-                    dependency_digests(
-                        session_state,
-                        node,
-                        key,
-                    ),
-                "triggeringEventIds":
-                    list(
-                        parent_state[
-                            "eventIds"
-                        ]
-                    ),
-            }
-
-    # --------------------------------------------------------
-    # Ready but no cache.
-    # --------------------------------------------------------
-
-    return {
-        "node": node,
-        "action": "rerun",
-        "reasonCodes": [
-            "CACHE_MISS"
-        ],
-        "dependencyDigests":
-            dependency_digests(
-                session_state,
-                node,
-                key,
-            ),
-        "triggeringEventIds":
-            list(
-                node_state[
-                    "eventIds"
-                ]
-            ),
-    }
-
-
-def build_response(
-    session_state,
-    accepted,
-    ignored,
-):
-    return {
-        "revision": session_state[
-            "revision"
-        ],
-        "acceptedEventIds": accepted,
-        "ignoredEventIds": ignored,
-        "nodes": [
-            node_output(
-                session_state,
-                node,
+            not isinstance(
+                latencies,
+                dict
             )
-            for node in DAG
-        ],
+            or name not in latencies
+        ):
+
+            codes.append(
+                "INVALID_LINEAGE"
+            )
+
+        else:
+
+            latency = latencies[name]
+
+            if (
+                not is_finite_number(
+                    latency
+                )
+                or float(latency) < 0
+            ):
+                codes.append(
+                    "INVALID_LINEAGE"
+                )
+            else:
+                latency_ms = float(
+                    latency
+                )
+
+        # ----------------------------------------------------
+        # Predictions.
+        # ----------------------------------------------------
+
+        predictions_valid = rows_valid
+
+        if predictions_valid:
+
+            for row in rows:
+
+                _, ok = prediction_for(
+                    row,
+                    name,
+                )
+
+                if not ok:
+                    predictions_valid = False
+                    break
+
+        if not predictions_valid:
+
+            codes.append(
+                "INVALID_PREDICTIONS"
+            )
+
+        else:
+
+            correct = sum(
+                1
+                for row in rows
+                if row[
+                    "predictions"
+                ][name]
+                == row["label"]
+            )
+
+            aggregate = round(
+                correct / len(rows),
+                12,
+            )
+
+            # ------------------------------------------------
+            # Slice accuracy.
+            # ------------------------------------------------
+
+            for slice_name, floor in (
+                policy[
+                    "requiredSlices"
+                ].items()
+                if policy_valid
+                else []
+            ):
+
+                slice_rows = [
+                    row
+                    for row in rows
+                    if row["slice"]
+                    == slice_name
+                ]
+
+                if len(slice_rows) == 0:
+
+                    codes.append(
+                        "MISSING_SLICE:"
+                        + slice_name
+                    )
+
+                    continue
+
+                slice_correct = sum(
+                    1
+                    for row in slice_rows
+                    if row[
+                        "predictions"
+                    ][name]
+                    == row["label"]
+                )
+
+                value = round(
+                    slice_correct
+                    / len(slice_rows),
+                    12,
+                )
+
+                slice_values[
+                    slice_name
+                ] = value
+
+                if value < float(floor):
+                    codes.append(
+                        "SLICE_FLOOR:"
+                        + slice_name
+                    )
+
+        # ----------------------------------------------------
+        # Aggregate gate.
+        # ----------------------------------------------------
+
+        if (
+            aggregate is not None
+            and policy_valid
+            and aggregate
+            < float(
+                policy[
+                    "aggregateFloor"
+                ]
+            )
+        ):
+            codes.append(
+                "AGGREGATE_FLOOR"
+            )
+
+        # ----------------------------------------------------
+        # Size gate.
+        # ----------------------------------------------------
+
+        if (
+            total_bytes is not None
+            and policy_valid
+            and total_bytes
+            > policy["maxBytes"]
+        ):
+            codes.append(
+                "SIZE_LIMIT"
+            )
+
+        # ----------------------------------------------------
+        # Latency gate.
+        # ----------------------------------------------------
+
+        if (
+            latency_ms is not None
+            and policy_valid
+            and latency_ms
+            > float(
+                policy["maxLatencyMs"]
+            )
+        ):
+            codes.append(
+                "LATENCY_LIMIT"
+            )
+
+        codes = unique_sorted_codes(
+            codes
+        )
+
+        results.append({
+            "name": name,
+            "aggregate": aggregate,
+            "slices": slice_values,
+            "totalBytes": total_bytes,
+            "latencyMs": latency_ms,
+            "admitted": len(codes) == 0,
+            "reasonCodes": codes,
+        })
+
+    # --------------------------------------------------------
+    # Results follow candidateOrder.
+    # UTF-8 name is fallback.
+    # --------------------------------------------------------
+
+    results.sort(
+        key=lambda r: (
+            order_index.get(
+                r["name"],
+                len(order_index),
+            ),
+            u8(r["name"]),
+        )
+    )
+
+    # --------------------------------------------------------
+    # Select admitted candidate.
+    # --------------------------------------------------------
+
+    admitted = [
+        r
+        for r in results
+        if r["admitted"]
+    ]
+
+    if len(admitted) == 0:
+
+        selected = None
+        manifest = None
+
+    else:
+
+        winner = min(
+            admitted,
+            key=lambda r: (
+                r["totalBytes"],
+                r["latencyMs"],
+                order_index.get(
+                    r["name"],
+                    len(order_index),
+                ),
+                u8(r["name"]),
+            ),
+        )
+
+        selected = winner[
+            "name"
+        ]
+
+        # Exactly the recorded frozen winner object.
+        manifest = deepcopy(
+            candidate_map[selected]
+        )
+
+    return {
+        "freezeId": freeze_id,
+        "selected": selected,
+        "results": results,
+        "packageManifest": manifest,
     }
 
 
 # ============================================================
-# Main endpoint
+# POST /quantize
 # ============================================================
 
-@app.post("/pipeline")
-async def pipeline(request: Request):
+@app.post("/quantize")
+async def quantize(request: Request):
 
     try:
         body = await request.json()
     except Exception:
-        return bad_request()
-
-    if not validate_pipeline_request(
-        body
-    ):
-        return bad_request()
-
-    session = body[
-        "session"
-    ]
-
-    revision = body[
-        "revision"
-    ]
-
-    inputs = body[
-        "inputs"
-    ]
-
-    events = body[
-        "events"
-    ]
-
-    # --------------------------------------------------------
-    # Validate every event before mutation.
-    #
-    # This guarantees that malformed events cannot partially
-    # mutate the state.
-    # --------------------------------------------------------
-
-    for event in events:
-
-        if not validate_event(event):
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error":
-                        "INVALID_EVENT"
-                },
-            )
-
-    # --------------------------------------------------------
-    # Canonical request fingerprint.
-    #
-    # Extra metadata is deliberately included.
-    # --------------------------------------------------------
-
-    input_fingerprint = fingerprint(
-        inputs
-    )
-
-    with LOCK:
-
-        existing = STATE.get(
-            session
+        return http_error(
+            400,
+            "INVALID_INPUT",
         )
 
-        # ====================================================
-        # First request for this session
-        # ====================================================
+    if not isinstance(body, dict):
+        return http_error(
+            400,
+            "INVALID_INPUT",
+        )
 
-        if existing is None:
+    phase = body.get("phase")
 
-            session_state = make_state(
-                revision,
-                dict(inputs),
-                input_fingerprint,
+    # --------------------------------------------------------
+    # Unknown/missing phase.
+    # --------------------------------------------------------
+
+    if phase not in (
+        FREEZE,
+        SELECT,
+    ):
+        return http_error(
+            400,
+            "INVALID_INPUT",
+        )
+
+    # ========================================================
+    # FREEZE
+    # ========================================================
+
+    if phase == FREEZE:
+
+        if not validate_freeze_request(
+            body
+        ):
+            return http_error(
+                400,
+                "INVALID_INPUT",
             )
 
-            accepted = []
-            ignored = []
-
-            # Process events sequentially.
-            for event in events:
-
-                conflict = process_event(
-                    session_state,
-                    event,
-                    accepted,
-                    ignored,
-                )
-
-                if conflict is not None:
-                    return error(
-                        conflict
-                    )
-
-            STATE[session] = (
-                session_state
-            )
-
-            return build_response(
-                session_state,
-                accepted,
-                ignored,
-            )
-
-        # ====================================================
-        # Existing session
-        # ====================================================
-
-        # Same revision requires exactly identical inputs,
-        # including extra metadata.
-        if revision == existing[
-            "revision"
-        ]:
-
-            if (
-                input_fingerprint
-                != existing[
-                    "inputFingerprint"
-                ]
-            ):
-                return error(
-                    "REVISION_CONFLICT"
-                )
-
-            # Work on a deep copy so a batch conflict can
-            # atomically roll back everything.
-            session_state = json.loads(
-                json.dumps(
-                    existing,
-                    ensure_ascii=False,
-                )
-            )
-
-            accepted = []
-            ignored = []
-
-            for event in events:
-
-                conflict = process_event(
-                    session_state,
-                    event,
-                    accepted,
-                    ignored,
-                )
-
-                if conflict is not None:
-                    return error(
-                        conflict
-                    )
-
-            STATE[session] = (
-                session_state
-            )
-
-            return build_response(
-                session_state,
-                accepted,
-                ignored,
-            )
-
-        # ====================================================
-        # New revision
-        # ====================================================
-
-        if revision > existing[
-            "revision"
-        ]:
-
-            # Successful content-addressed cache entries survive
-            # revision changes.
-            preserved_cache = (
-                existing["cache"]
-            )
-
-            session_state = make_state(
-                revision,
-                dict(inputs),
-                input_fingerprint,
-            )
-
-            session_state[
-                "cache"
-            ] = json.loads(
-                json.dumps(
-                    preserved_cache,
-                    ensure_ascii=False,
-                )
-            )
-
-            accepted = []
-            ignored = []
-
-            for event in events:
-
-                conflict = process_event(
-                    session_state,
-                    event,
-                    accepted,
-                    ignored,
-                )
-
-                if conflict is not None:
-                    return error(
-                        conflict
-                    )
-
-            STATE[session] = (
-                session_state
-            )
-
-            return build_response(
-                session_state,
-                accepted,
-                ignored,
-            )
-
-        # ----------------------------------------------------
-        # Older revision.
-        # ----------------------------------------------------
-
-        # The request itself is an older revision. Its events
-        # are ignored, but it must not mutate current state.
-        ignored = [
-            event["eventId"]
-            for event in events
+        freeze_id = body[
+            "freezeId"
         ]
 
-        return build_response(
-            existing,
-            [],
-            ignored,
+        req_fingerprint = fingerprint(
+            body
         )
+
+        with LOCK:
+
+            existing = STORE.get(
+                freeze_id
+            )
+
+            if existing is not None:
+
+                if (
+                    existing[
+                        "fingerprint"
+                    ]
+                    != req_fingerprint
+                ):
+                    return http_error(
+                        409,
+                        "FREEZE_ID_CONFLICT",
+                    )
+
+                return existing[
+                    "response"
+                ]
+
+            response = create_freeze_response(
+                body
+            )
+
+            if response is None:
+                return http_error(
+                    400,
+                    "INVALID_INPUT",
+                )
+
+            STORE[freeze_id] = {
+                "fingerprint":
+                    req_fingerprint,
+                "response":
+                    response,
+            }
+
+            return response
+
+    # ========================================================
+    # SELECT
+    # ========================================================
+
+    required = {
+        "phase",
+        "freezeId",
+        "candidates",
+        "policy",
+        "latencies",
+        "rows",
+    }
+
+    if set(body.keys()) != required:
+        return http_error(
+            400,
+            "INVALID_INPUT",
+        )
+
+    if not isinstance(
+        body["freezeId"],
+        str,
+    ):
+        return http_error(
+            400,
+            "INVALID_INPUT",
+        )
+
+    # The contract explicitly requires arrays for both
+    # candidates and rows and an object for policy.
+    if (
+        not isinstance(
+            body["candidates"],
+            list,
+        )
+        or len(body["candidates"]) == 0
+        or not isinstance(
+            body["rows"],
+            list,
+        )
+        or len(body["rows"]) == 0
+        or not isinstance(
+            body["policy"],
+            dict,
+        )
+        or not isinstance(
+            body["latencies"],
+            dict,
+        )
+    ):
+        return http_error(
+            400,
+            "INVALID_INPUT",
+        )
+
+    freeze_id = body[
+        "freezeId"
+    ]
+
+    with LOCK:
+        frozen = STORE.get(
+            freeze_id
+        )
+
+    # --------------------------------------------------------
+    # Unknown freeze ID.
+    # --------------------------------------------------------
+
+    if frozen is None:
+
+        return {
+            "freezeId": freeze_id,
+            "selected": None,
+            "results": [],
+            "packageManifest": None,
+        }
+
+    return perform_select(
+        body,
+        frozen["response"],
+    )
 
 
 # ============================================================
-# Health endpoint
+# Simple health endpoint
 # ============================================================
 
 @app.get("/")
 async def root():
     return {
         "status": "ok",
-        "endpoint": "/pipeline",
+        "endpoint": "/quantize",
     }
